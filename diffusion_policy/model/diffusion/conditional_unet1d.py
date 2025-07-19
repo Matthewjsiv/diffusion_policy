@@ -12,9 +12,9 @@ from diffusion_policy.model.diffusion.positional_embedding import SinusoidalPosE
 logger = logging.getLogger(__name__)
 
 class ConditionalResidualBlock1D(nn.Module):
-    def __init__(self, 
-            in_channels, 
-            out_channels, 
+    def __init__(self,
+            in_channels,
+            out_channels,
             cond_dim,
             kernel_size=3,
             n_groups=8,
@@ -67,7 +67,7 @@ class ConditionalResidualBlock1D(nn.Module):
 
 
 class ConditionalUnet1D(nn.Module):
-    def __init__(self, 
+    def __init__(self,
         input_dim,
         local_cond_dim=None,
         global_cond_dim=None,
@@ -75,7 +75,8 @@ class ConditionalUnet1D(nn.Module):
         down_dims=[256,512,1024],
         kernel_size=3,
         n_groups=8,
-        cond_predict_scale=False
+        cond_predict_scale=False,
+        predict_scalar=False
         ):
         super().__init__()
         all_dims = [input_dim] + list(down_dims)
@@ -101,12 +102,12 @@ class ConditionalUnet1D(nn.Module):
             local_cond_encoder = nn.ModuleList([
                 # down encoder
                 ConditionalResidualBlock1D(
-                    dim_in, dim_out, cond_dim=cond_dim, 
+                    dim_in, dim_out, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
                     cond_predict_scale=cond_predict_scale),
                 # up encoder
                 ConditionalResidualBlock1D(
-                    dim_in, dim_out, cond_dim=cond_dim, 
+                    dim_in, dim_out, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
                     cond_predict_scale=cond_predict_scale)
             ])
@@ -125,16 +126,25 @@ class ConditionalUnet1D(nn.Module):
             ),
         ])
 
+        self.predict_scalar = predict_scalar
+        if predict_scalar:
+            self.scalar_head = nn.Sequential(
+                nn.Linear(mid_dim*6, mid_dim*2),
+                nn.ReLU(),
+                nn.Linear(mid_dim*2, 1),
+                nn.ReLU(), #relu to enforce positive cost?
+            )
+
         down_modules = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (len(in_out) - 1)
             down_modules.append(nn.ModuleList([
                 ConditionalResidualBlock1D(
-                    dim_in, dim_out, cond_dim=cond_dim, 
+                    dim_in, dim_out, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
                     cond_predict_scale=cond_predict_scale),
                 ConditionalResidualBlock1D(
-                    dim_out, dim_out, cond_dim=cond_dim, 
+                    dim_out, dim_out, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
                     cond_predict_scale=cond_predict_scale),
                 Downsample1d(dim_out) if not is_last else nn.Identity()
@@ -154,7 +164,7 @@ class ConditionalUnet1D(nn.Module):
                     cond_predict_scale=cond_predict_scale),
                 Upsample1d(dim_in) if not is_last else nn.Identity()
             ]))
-        
+
         final_conv = nn.Sequential(
             Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
             nn.Conv1d(start_dim, input_dim, 1),
@@ -170,9 +180,9 @@ class ConditionalUnet1D(nn.Module):
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
         )
 
-    def forward(self, 
-            sample: torch.Tensor, 
-            timestep: Union[torch.Tensor, float, int], 
+    def forward(self,
+            sample: torch.Tensor,
+            timestep: Union[torch.Tensor, float, int],
             local_cond=None, global_cond=None, **kwargs):
         """
         x: (B,T,input_dim)
@@ -199,7 +209,7 @@ class ConditionalUnet1D(nn.Module):
             global_feature = torch.cat([
                 global_feature, global_cond
             ], axis=-1)
-        
+
         # encode local features
         h_local = list()
         if local_cond is not None:
@@ -209,7 +219,7 @@ class ConditionalUnet1D(nn.Module):
             h_local.append(x)
             x = resnet2(local_cond, global_feature)
             h_local.append(x)
-        
+
         x = sample
         h = []
         for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
@@ -222,6 +232,9 @@ class ConditionalUnet1D(nn.Module):
 
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
+
+        if self.predict_scalar:
+            scalar_pred = self.scalar_head(x.flatten(1)) #mean pooling for now
 
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
             x = torch.cat((x, h.pop()), dim=1)
@@ -238,5 +251,8 @@ class ConditionalUnet1D(nn.Module):
         x = self.final_conv(x)
 
         x = einops.rearrange(x, 'b t h -> b h t')
-        return x
 
+        if self.predict_scalar:
+            return x, scalar_pred
+        else:
+            return x
